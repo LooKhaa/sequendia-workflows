@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from worker.workflows.html_to_pdf import ASSETS_DIR, HtmlToPdfInput
+from worker.workflows.html_to_pdf import HtmlToPdfInput
+
+ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
 def test_assets_present() -> None:

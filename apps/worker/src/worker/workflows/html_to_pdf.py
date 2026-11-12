@@ -1,36 +1,18 @@
 """Workflow html-to-pdf : rendu PDF print-ready de la charte Sequendia.
 
 WeasyPrint + polices embarquées (Lora, Source Sans 3, OpenDyslexic) :
-aucune dépendance réseau au rendu, typographie déterministe. Le CSS des
-polices est injecté dans le <head> du document avant le rendu, et
-`base_url` pointe sur le dossier des assets pour résoudre les url().
+aucune dépendance réseau au rendu, typographie déterministe.
+
+Toute la logique fichiers (localisation des assets, lecture du CSS des
+polices, rendu WeasyPrint) vit dans l'activité `render_pdf`, hors du
+sandbox déterministe du workflow. Le module ne fait aucun I/O à l'import.
 """
 
 import base64
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 import mistralai.workflows as workflows
-
-
-def _assets_dir() -> Path:
-    """Localise apps/worker/assets, en dev (source) comme en image (site-packages)."""
-    candidates = [
-        Path(__file__).resolve().parents[3] / "assets",  # dev : src/worker/workflows
-        Path.cwd() / "assets",
-        Path("/app/apps/worker/assets"),  # image managée
-    ]
-    for c in candidates:
-        if (c / "fonts.css").is_file():
-            return c
-    raise FileNotFoundError(
-        "Dossier assets introuvable (fonts.css attendu à côté de fonts/)."
-    )
-
-
-ASSETS_DIR = _assets_dir()
-FONTS_CSS = (ASSETS_DIR / "fonts.css").read_text(encoding="utf-8")
 
 
 class HtmlToPdfInput(BaseModel):
@@ -51,15 +33,35 @@ class HtmlToPdfOutput(BaseModel):
 @workflows.activity()
 async def render_pdf(html: str) -> tuple[bytes, int]:
     """Convertit le HTML en PDF via WeasyPrint, avec les polices embarquées."""
-    from weasyprint import HTML
+    from pathlib import Path
+
+    def _assets_dir() -> Path:
+        """Localise apps/worker/assets, en dev (source) comme en image."""
+        candidates = [
+            Path(__file__).resolve().parents[3] / "assets",  # dev : src/worker/workflows
+            Path.cwd() / "assets",
+            Path("/app/apps/worker/assets"),  # image managée
+        ]
+        for candidate in candidates:
+            if (candidate / "fonts.css").is_file():
+                return candidate
+        raise FileNotFoundError(
+            "Dossier assets introuvable (fonts.css attendu à côté de fonts/)."
+        )
+
+    assets_dir = _assets_dir()
+    fonts_css = (assets_dir / "fonts.css").read_text(encoding="utf-8")
 
     if "</head>" in html:
         full_html = html.replace(
-            "</head>", f"<style>{FONTS_CSS}</style></head>", 1
+            "</head>", f"<style>{fonts_css}</style></head>", 1
         )
     else:
-        full_html = f"<html><head><style>{FONTS_CSS}</style></head>{html}</html>"
-    document = HTML(string=full_html, base_url=str(ASSETS_DIR)).render()
+        full_html = f"<html><head><style>{fonts_css}</style></head>{html}</html>"
+
+    from weasyprint import HTML
+
+    document = HTML(string=full_html, base_url=str(assets_dir)).render()
     return document.write_pdf(), len(document.pages)
 
 
