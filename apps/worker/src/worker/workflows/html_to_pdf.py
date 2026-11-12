@@ -86,10 +86,10 @@ def _assets_dir():
 @workflows.activity()
 async def generate_illustration(prompt: str, style: str) -> str:
     """Génère une image via l'agent Mistral image_generation, renvoie du PNG base64."""
-    from mistralai import Mistral
     from temporalio.exceptions import ApplicationError
+    from utils.mistral import mistral_client
 
-    client = Mistral()  # token de service injecté par la plateforme
+    client = mistral_client()  # token de service injecté par la plateforme
     agent = client.beta.agents.create(
         model="mistral-medium-latest",
         name="Sequendia illustrateur",
