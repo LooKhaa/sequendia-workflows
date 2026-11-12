@@ -3,14 +3,13 @@
 WeasyPrint + polices embarquées (Lora, Source Sans 3, OpenDyslexic) :
 aucune dépendance réseau pour le rendu, typographie déterministe.
 
-Illustrations : optionnellement, le workflow génère des images via l'agent
-Mistral `image_generation` (API conversations), les télécharge via l'API
-files et les intègre au rendu. Le HTML les référence par leur nom de
+Illustrations : le client fournit les images en base64 (générées en amont,
+ex. via l'outil image_generation). Le HTML les référence par leur nom de
 fichier relatif, ex. <img src="paysage.png">.
 
 Règles d'architecture respectées :
-- toute la logique fichiers et réseau vit dans les activités, hors du
-  sandbox déterministe du workflow ; le module ne fait aucun I/O à l'import ;
+- toute la logique fichiers vit dans les activités, hors du sandbox
+  déterministe du workflow ; le module ne fait aucun I/O à l'import ;
 - les activités renvoient des chaînes base64 : la plateforme sérialise les
   résultats d'activité en JSON, qui n'accepte pas d'octets bruts ;
 - les erreurs d'entrée sont non-retryables : retenter ne changerait rien.
@@ -27,14 +26,6 @@ import mistralai.workflows as workflows
 
 logger = structlog.get_logger("workflows.html_to_pdf")
 
-STYLE_DEFAUT = (
-    "Illustration vectorielle plate (flat design), élégante et minimaliste, "
-    "style manuel scolaire français premium : formes simples et épurées, "
-    "palette douce et cohérente de bleu royal (#2563EB), bleu nuit (#1E50C8), "
-    "bleu pâle (#DBEAFE) et touches d'ambre (#D97706), fond blanc ou bleu "
-    "très pâle. Aucun texte, aucune lettre, aucun mot."
-)
-
 
 class Illustration(BaseModel):
     filename: str = Field(
@@ -42,7 +33,11 @@ class Illustration(BaseModel):
         description="Nom de fichier par lequel le HTML référence l'image (ex. paysage.png).",
         pattern=r"^[\w\-. ]+\.(png|jpg|jpeg)$",
     )
-    prompt: str = Field(..., description="Description de l'illustration à générer.")
+    data_base64: str = Field(
+        ...,
+        min_length=100,
+        description="Contenu de l'image encodé en base64 (PNG ou JPEG), généré en amont.",
+    )
 
 
 class HtmlToPdfInput(BaseModel):
@@ -54,11 +49,7 @@ class HtmlToPdfInput(BaseModel):
     )
     illustrations: list[Illustration] = Field(
         default_factory=list,
-        description="Illustrations à générer puis à intégrer (référencées par nom de fichier dans le HTML).",
-    )
-    style: str = Field(
-        default=STYLE_DEFAUT,
-        description="Style commun appliqué à chaque prompt d'illustration.",
+        description="Illustrations (base64) à intégrer, référencées par nom de fichier dans le HTML.",
     )
 
 
@@ -84,48 +75,23 @@ def _assets_dir():
 
 
 @workflows.activity()
-async def generate_illustration(prompt: str, style: str) -> str:
-    """Génère une image via l'agent Mistral image_generation, renvoie du PNG base64."""
+async def validate_illustration(filename: str, data_base64: str) -> tuple[str, str]:
+    """Valide le base64 d'une illustration, renvoie (filename, base64 décodé re-encodé)."""
     from temporalio.exceptions import ApplicationError
-    from utils.mistral import mistral_client
 
-    client = mistral_client()  # token de service injecté par la plateforme
-    agent = client.beta.agents.create(
-        model="mistral-medium-latest",
-        name="Sequendia illustrateur",
-        description="Génère des illustrations pour les supports pédagogiques.",
-        instructions=(
-            "Utilise l'outil image_generation pour répondre. "
-            "Ne génère qu'une seule image par demande."
-        ),
-        tools=[{"type": "image_generation"}],
-    )
     try:
-        conversation = client.beta.conversations.start(
-            agent_id=agent.id, inputs=f"{style}. {prompt}"
+        raw = base64.b64decode(data_base64, validate=True)
+    except Exception as err:
+        raise ApplicationError(
+            f"Illustration {filename}: base64 invalide ({err}).",
+            non_retryable=True,
+        ) from err
+    if not raw.startswith((b"\x89PNG", b"\xff\xd8")):
+        raise ApplicationError(
+            f"Illustration {filename}: format non supporté (PNG ou JPEG attendu).",
+            non_retryable=True,
         )
-        file_id = None
-        for entry in conversation.outputs or []:
-            if getattr(entry, "type", "") != "message.output":
-                continue
-            for part in getattr(entry, "content", []) or []:
-                if getattr(part, "type", "") == "tool_file" and getattr(part, "file_id", None):
-                    file_id = part.file_id
-                    break
-            if file_id:
-                break
-        if file_id is None:
-            raise ApplicationError(
-                f"Aucun fichier image renvoyé par l'agent pour : {prompt[:80]}",
-                non_retryable=True,
-            )
-        response = client.files.download(file_id=file_id)
-        return base64.b64encode(response.content).decode("ascii")
-    finally:
-        try:
-            client.beta.agents.delete(agent_id=agent.id)
-        except Exception:  # nettoyage best-effort
-            pass
+    return filename, base64.b64encode(raw).decode("ascii")
 
 
 @workflows.activity()
@@ -148,7 +114,7 @@ async def render_pdf(html: str, images: dict[str, str]) -> tuple[str, int]:
             non_retryable=True,
         )
 
-    # Espace de rendu : copie des assets (polices) + images générées.
+    # Espace de rendu : copie des assets (polices) + images.
     render_dir = Path(tempfile.mkdtemp(prefix="sequendia-render-"))
     try:
         shutil.copytree(assets_dir, render_dir, dirs_exist_ok=True)
@@ -193,9 +159,9 @@ async def render_pdf(html: str, images: dict[str, str]) -> tuple[str, int]:
     workflow_description=(
         "Convertit un document HTML print-ready (charte graphique Sequendia) "
         "en PDF stylisé via WeasyPrint, avec les polices Lora, Source Sans 3 "
-        "et OpenDyslexic embarquées. Optionnellement génère des illustrations "
-        "via l'agent Mistral image_generation et les intègre au rendu. "
-        "Retourne le PDF en base64, le nombre de pages et le nom de fichier."
+        "et OpenDyslexic embarquées. Les illustrations sont fournies en base64 "
+        "et intégrées au rendu. Retourne le PDF en base64, le nombre de pages "
+        "et le nom de fichier."
     ),
 )
 class HtmlToPdfWorkflow:
@@ -203,9 +169,11 @@ class HtmlToPdfWorkflow:
     async def run(self, input: HtmlToPdfInput) -> HtmlToPdfOutput:
         images: dict[str, str] = {}
         for illustration in input.illustrations:
-            images[illustration.filename] = await generate_illustration(
-                prompt=illustration.prompt, style=input.style
+            filename, image_b64 = await validate_illustration(
+                filename=illustration.filename,
+                data_base64=illustration.data_base64,
             )
+            images[filename] = image_b64
         pdf_base64, page_count = await render_pdf(input.html, images)
         return HtmlToPdfOutput(
             filename=input.filename,
