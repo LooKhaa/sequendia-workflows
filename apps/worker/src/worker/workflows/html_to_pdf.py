@@ -3,16 +3,24 @@
 WeasyPrint + polices embarquées (Lora, Source Sans 3, OpenDyslexic) :
 aucune dépendance réseau au rendu, typographie déterministe.
 
-Toute la logique fichiers (localisation des assets, lecture du CSS des
-polices, rendu WeasyPrint) vit dans l'activité `render_pdf`, hors du
-sandbox déterministe du workflow. Le module ne fait aucun I/O à l'import.
+Règles d'architecture respectées :
+- toute la logique fichiers (assets, CSS des polices, rendu WeasyPrint) vit
+  dans l'activité `render_pdf`, hors du sandbox déterministe du workflow ;
+  le module ne fait aucun I/O à l'import ;
+- l'activité renvoie le PDF déjà encodé en base64 : la plateforme sérialise
+  les résultats d'activité en JSON, qui n'accepte pas d'octets bruts ;
+- les erreurs d'entrée (HTML vide ou non-HTML) sont non-retryables : retenter
+  ne changerait rien, le workflow échoue immédiatement avec un message clair.
 """
 
 import base64
 
+import structlog
 from pydantic import BaseModel, Field
 
 import mistralai.workflows as workflows
+
+logger = structlog.get_logger("workflows.html_to_pdf")
 
 
 class HtmlToPdfInput(BaseModel):
@@ -31,9 +39,17 @@ class HtmlToPdfOutput(BaseModel):
 
 
 @workflows.activity()
-async def render_pdf(html: str) -> tuple[bytes, int]:
-    """Convertit le HTML en PDF via WeasyPrint, avec les polices embarquées."""
+async def render_pdf(html: str) -> tuple[str, int]:
+    """Convertit le HTML en PDF (base64) via WeasyPrint, polices embarquées."""
     from pathlib import Path
+
+    from temporalio.exceptions import ApplicationError
+
+    if not html or not html.strip():
+        raise ApplicationError(
+            "Le champ 'html' est vide : fournir un document HTML print-ready.",
+            non_retryable=True,
+        )
 
     def _assets_dir() -> Path:
         """Localise apps/worker/assets, en dev (source) comme en image."""
@@ -45,8 +61,9 @@ async def render_pdf(html: str) -> tuple[bytes, int]:
         for candidate in candidates:
             if (candidate / "fonts.css").is_file():
                 return candidate
-        raise FileNotFoundError(
-            "Dossier assets introuvable (fonts.css attendu à côté de fonts/)."
+        raise ApplicationError(
+            "Dossier assets introuvable (fonts.css attendu à côté de fonts/).",
+            non_retryable=True,
         )
 
     assets_dir = _assets_dir()
@@ -61,8 +78,23 @@ async def render_pdf(html: str) -> tuple[bytes, int]:
 
     from weasyprint import HTML
 
-    document = HTML(string=full_html, base_url=str(assets_dir)).render()
-    return document.write_pdf(), len(document.pages)
+    try:
+        document = HTML(string=full_html, base_url=str(assets_dir)).render()
+    except Exception as err:
+        # HTML invalide : retenter ne sert à rien.
+        raise ApplicationError(
+            f"Rendu WeasyPrint impossible (HTML invalide ?) : {err}",
+            non_retryable=True,
+        ) from err
+
+    pdf_bytes = document.write_pdf()
+    pdf_base64 = base64.b64encode(pdf_bytes).decode("ascii")
+    logger.info(
+        "PDF rendu",
+        pages=len(document.pages),
+        pdf_base64_size=len(pdf_base64),
+    )
+    return pdf_base64, len(document.pages)
 
 
 @workflows.workflow.define(
@@ -78,9 +110,9 @@ async def render_pdf(html: str) -> tuple[bytes, int]:
 class HtmlToPdfWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: HtmlToPdfInput) -> HtmlToPdfOutput:
-        pdf_bytes, page_count = await render_pdf(input.html)
+        pdf_base64, page_count = await render_pdf(input.html)
         return HtmlToPdfOutput(
             filename=input.filename,
-            pdf_base64=base64.b64encode(pdf_bytes).decode("ascii"),
+            pdf_base64=pdf_base64,
             page_count=page_count,
         )
