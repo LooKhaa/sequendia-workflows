@@ -74,6 +74,14 @@ class HtmlToPdfInput(BaseModel):
             "ex. diapo/cover.png.b64), décodées au rendu ; référencées par filename dans le HTML."
         ),
     )
+    bundled_transform: str | None = Field(
+        default=None,
+        description=(
+            'Transformation des illustrations embarquées. "square720" : '
+            "crop carré centré puis 720x720, JPEG qualité 70."
+        ),
+        pattern=r"^(square720)$",
+    )
 
 
 class HtmlToPdfOutput(BaseModel):
@@ -131,7 +139,25 @@ def _bundled_roots() -> list:
 
 
 @workflows.activity()
-async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str]) -> tuple[str, int]:
+def _square720_jpeg(raw: bytes) -> bytes:
+    """Crop carré centré, redimensionné en 720x720, JPEG qualité 70."""
+    import io
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    side = min(img.width, img.height)
+    left = (img.width - side) // 2
+    top = (img.height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    img = img.resize((720, 720), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=70, optimize=True)
+    return out.getvalue()
+
+
+@workflows.activity()
+async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str], transform: str | None = None) -> tuple[str, int]:
     """Convertit le HTML en PDF (base64) via WeasyPrint, polices embarquées."""
     from pathlib import Path
 
@@ -175,6 +201,8 @@ async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str])
                     f"Illustration embarquée {filename} : format non supporté (PNG ou JPEG attendu).",
                     non_retryable=True,
                 )
+            if transform == "square720":
+                raw = _square720_jpeg(raw)
             (render_dir / filename).write_bytes(raw)
 
         fonts_css = (render_dir / "fonts.css").read_text(encoding="utf-8")
@@ -189,9 +217,7 @@ async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str])
         from weasyprint import HTML
 
         try:
-            document = HTML(string=full_html, base_url=str(render_dir)).render(
-                optimize_images=True, jpeg_quality=70, dpi=120
-            )
+                    document = HTML(string=full_html, base_url=str(render_dir)).render()
         except Exception as err:
             raise ApplicationError(
                 f"Rendu WeasyPrint impossible (HTML invalide ?) : {err}",
@@ -236,7 +262,7 @@ class HtmlToPdfWorkflow:
         bundled_map = {
             bundled.filename: bundled.path for bundled in input.bundled_illustrations
         }
-        pdf_base64, page_count = await render_pdf(input.html, images, bundled_map)
+        pdf_base64, page_count = await render_pdf(input.html, images, bundled_map, input.bundled_transform)
         return HtmlToPdfOutput(
             filename=input.filename,
             pdf_base64=pdf_base64,
