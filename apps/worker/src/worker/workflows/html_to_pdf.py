@@ -138,7 +138,6 @@ def _bundled_roots() -> list:
     return candidates
 
 
-@workflows.activity()
 def _square720_jpeg(raw: bytes) -> bytes:
     """Crop carré centré, redimensionné en 720x720, JPEG qualité 70."""
     import io
