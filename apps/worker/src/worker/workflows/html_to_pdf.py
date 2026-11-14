@@ -189,7 +189,9 @@ async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str])
         from weasyprint import HTML
 
         try:
-            document = HTML(string=full_html, base_url=str(render_dir)).render()
+            document = HTML(string=full_html, base_url=str(render_dir)).render(
+                optimize_images=True, jpeg_quality=75
+            )
         except Exception as err:
             raise ApplicationError(
                 f"Rendu WeasyPrint impossible (HTML invalide ?) : {err}",
