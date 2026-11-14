@@ -131,41 +131,7 @@ def _bundled_roots() -> list:
 
 
 @workflows.activity()
-async def load_bundled_illustration(filename: str, path: str) -> str:
-    """Charge une illustration embarquée dans l'image worker, renvoie son contenu en base64."""
-    from pathlib import Path
-
-    from temporalio.exceptions import ApplicationError
-
-    raw = None
-    for root in _bundled_roots():
-        candidate = root / path
-        if candidate.is_file():
-            raw = candidate.read_bytes()
-            break
-    if raw is None:
-        raise ApplicationError(
-            f"Illustration embarquée introuvable : {path}",
-            non_retryable=True,
-        )
-    if path.endswith(".b64"):
-        try:
-            raw = base64.b64decode(raw, validate=True)
-        except Exception as err:
-            raise ApplicationError(
-                f"Illustration embarquée {path} : base64 invalide ({err}).",
-                non_retryable=True,
-            ) from err
-    if not raw.startswith((b"\x89PNG", b"\xff\xd8")):
-        raise ApplicationError(
-            f"Illustration embarquée {filename} : format non supporté (PNG ou JPEG attendu).",
-            non_retryable=True,
-        )
-    return base64.b64encode(raw).decode("ascii")
-
-
-@workflows.activity()
-async def render_pdf(html: str, images: dict[str, str]) -> tuple[str, int]:
+async def render_pdf(html: str, images: dict[str, str], bundled: dict[str, str]) -> tuple[str, int]:
     """Convertit le HTML en PDF (base64) via WeasyPrint, polices embarquées."""
     from pathlib import Path
 
@@ -190,6 +156,26 @@ async def render_pdf(html: str, images: dict[str, str]) -> tuple[str, int]:
         shutil.copytree(assets_dir, render_dir, dirs_exist_ok=True)
         for filename, image_b64 in (images or {}).items():
             (render_dir / filename).write_bytes(base64.b64decode(image_b64))
+        for filename, path in (bundled or {}).items():
+            raw = None
+            for root in _bundled_roots():
+                candidate = root / path
+                if candidate.is_file():
+                    raw = candidate.read_bytes()
+                    break
+            if raw is None:
+                raise ApplicationError(
+                    f"Illustration embarquée introuvable : {path}",
+                    non_retryable=True,
+                )
+            if path.endswith(".b64"):
+                raw = base64.b64decode(raw)
+            if not raw.startswith((b"\x89PNG", b"\xff\xd8")):
+                raise ApplicationError(
+                    f"Illustration embarquée {filename} : format non supporté (PNG ou JPEG attendu).",
+                    non_retryable=True,
+                )
+            (render_dir / filename).write_bytes(raw)
 
         fonts_css = (render_dir / "fonts.css").read_text(encoding="utf-8")
 
@@ -239,18 +225,16 @@ class HtmlToPdfWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: HtmlToPdfInput) -> HtmlToPdfOutput:
         images: dict[str, str] = {}
-        for bundled in input.bundled_illustrations:
-            images[bundled.filename] = await load_bundled_illustration(
-                filename=bundled.filename,
-                path=bundled.path,
-            )
         for illustration in input.illustrations:
             filename, image_b64 = await validate_illustration(
                 filename=illustration.filename,
                 data_base64=illustration.data_base64,
             )
             images[filename] = image_b64
-        pdf_base64, page_count = await render_pdf(input.html, images)
+        bundled_map = {
+            bundled.filename: bundled.path for bundled in input.bundled_illustrations
+        }
+        pdf_base64, page_count = await render_pdf(input.html, images, bundled_map)
         return HtmlToPdfOutput(
             filename=input.filename,
             pdf_base64=pdf_base64,
