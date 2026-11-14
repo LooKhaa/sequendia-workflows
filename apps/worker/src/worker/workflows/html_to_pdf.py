@@ -40,6 +40,22 @@ class Illustration(BaseModel):
     )
 
 
+class BundledIllustration(BaseModel):
+    filename: str = Field(
+        ...,
+        description="Nom de fichier par lequel le HTML référence l'image (ex. cover.png).",
+        pattern=r"^[\w\-. ]+\.(png|jpg|jpeg)$",
+    )
+    path: str = Field(
+        ...,
+        description=(
+            "Chemin du fichier source dans l'image worker (ex. diapo/cover.png.b64). "
+            "Un suffixe .b64 indique un fichier base64 à décoder."
+        ),
+        pattern=r"^[\w\-./ ]+\.(b64|png|jpg|jpeg)$",
+    )
+
+
 class HtmlToPdfInput(BaseModel):
     html: str = Field(..., description="Document HTML complet, print-ready (A4).")
     filename: str = Field(
@@ -50,6 +66,13 @@ class HtmlToPdfInput(BaseModel):
     illustrations: list[Illustration] = Field(
         default_factory=list,
         description="Illustrations (base64) à intégrer, référencées par nom de fichier dans le HTML.",
+    )
+    bundled_illustrations: list[BundledIllustration] = Field(
+        default_factory=list,
+        description=(
+            "Illustrations embarquées dans l'image worker (fichiers du dépôt, "
+            "ex. diapo/cover.png.b64), décodées au rendu ; référencées par filename dans le HTML."
+        ),
     )
 
 
@@ -92,6 +115,53 @@ async def validate_illustration(filename: str, data_base64: str) -> tuple[str, s
             non_retryable=True,
         )
     return filename, base64.b64encode(raw).decode("ascii")
+
+
+def _bundled_roots() -> list:
+    """Répertoires candidats où chercher les fichiers embarqués (repo complet dans l'image)."""
+    from pathlib import Path
+
+    candidates = [Path.cwd()]
+    try:
+        candidates.append(Path(__file__).resolve().parents[5])
+    except IndexError:  # mode source : parents remonte moins haut
+        pass
+    candidates.append(Path("/app"))
+    return candidates
+
+
+@workflows.activity()
+async def load_bundled_illustration(filename: str, path: str) -> str:
+    """Charge une illustration embarquée dans l'image worker, renvoie son contenu en base64."""
+    from pathlib import Path
+
+    from temporalio.exceptions import ApplicationError
+
+    raw = None
+    for root in _bundled_roots():
+        candidate = root / path
+        if candidate.is_file():
+            raw = candidate.read_bytes()
+            break
+    if raw is None:
+        raise ApplicationError(
+            f"Illustration embarquée introuvable : {path}",
+            non_retryable=True,
+        )
+    if path.endswith(".b64"):
+        try:
+            raw = base64.b64decode(raw, validate=True)
+        except Exception as err:
+            raise ApplicationError(
+                f"Illustration embarquée {path} : base64 invalide ({err}).",
+                non_retryable=True,
+            ) from err
+    if not raw.startswith((b"\x89PNG", b"\xff\xd8")):
+        raise ApplicationError(
+            f"Illustration embarquée {filename} : format non supporté (PNG ou JPEG attendu).",
+            non_retryable=True,
+        )
+    return base64.b64encode(raw).decode("ascii")
 
 
 @workflows.activity()
@@ -160,7 +230,8 @@ async def render_pdf(html: str, images: dict[str, str]) -> tuple[str, int]:
         "Convertit un document HTML print-ready (charte graphique Sequendia) "
         "en PDF stylisé via WeasyPrint, avec les polices Lora, Source Sans 3 "
         "et OpenDyslexic embarquées. Les illustrations sont fournies en base64 "
-        "et intégrées au rendu. Retourne le PDF en base64, le nombre de pages "
+        "et intégrées au rendu (base64 en entrée, ou fichiers embarqués du dépôt). "
+        "Retourne le PDF en base64, le nombre de pages "
         "et le nom de fichier."
     ),
 )
@@ -168,6 +239,11 @@ class HtmlToPdfWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: HtmlToPdfInput) -> HtmlToPdfOutput:
         images: dict[str, str] = {}
+        for bundled in input.bundled_illustrations:
+            images[bundled.filename] = await load_bundled_illustration(
+                filename=bundled.filename,
+                path=bundled.path,
+            )
         for illustration in input.illustrations:
             filename, image_b64 = await validate_illustration(
                 filename=illustration.filename,
